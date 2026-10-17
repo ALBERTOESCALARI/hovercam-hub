@@ -1,0 +1,25 @@
+# Run on any always-on box at home (Raspberry Pi 4/5, mini PC, NAS):
+#   HOVERCAM_API_URL=https://<your api> docker compose up -d
+# host networking is required: ONVIF discovery uses LAN multicast and WebRTC uses UDP.
+services:
+  go2rtc:
+    image: alexxit/go2rtc:1.9.9
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./go2rtc.yaml:/config/go2rtc.yaml:ro
+
+  hub:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    depends_on: [go2rtc]
+    environment:
+      HOVERCAM_API_URL: ${HOVERCAM_API_URL:-http://127.0.0.1:8000}
+      HOVERCAM_HUB_NAME: ${HOVERCAM_HUB_NAME:-HoverCam Hub}
+      GO2RTC_URL: http://127.0.0.1:1984
+    volumes:
+      - hub-state:/data
+
+volumes:
+  hub-state:

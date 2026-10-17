@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+state/
+*.egg-info/
+.pytest_cache/
+go2rtc
+go2rtc.zip

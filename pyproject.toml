@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hovercam-hub"
+version = "0.1.0"
+description = "HoverCam home hub agent: discovers cameras and relays WebRTC via go2rtc"
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.10,<4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9", "ruff>=0.9,<1"]
+
+[project.scripts]
+hovercam-hub = "hub.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["hub*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
