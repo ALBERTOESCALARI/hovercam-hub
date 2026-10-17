@@ -55,7 +55,8 @@ To re-pair from scratch, stop the hub and delete `state/hub_state.json`.
 3. Download `go2rtc_win64.zip` from the go2rtc releases page; put `go2rtc.exe` in the folder.
 4. To keep an existing pairing, copy `state-prod\hub_state.json` from the old machine into
    `state-prod\` here (and stop the hub there first). Otherwise it registers as a new hub.
-5. Double-click `start-hub.bat`. Allow both Windows Firewall prompts on **Private** networks
+5. Install it as a startup task (runs before sign-in, no window; logs to `hub.log`):
+   `schtasks /Create /TN "HoverCam Hub" /TR "%USERPROFILE%\hovercam-hub\start-hub.bat" /SC ONSTART /DELAY 0001:00 /RU SYSTEM /RL HIGHEST /F`
+   then `schtasks /Run /TN "HoverCam Hub"`. (Or double-click `start-hub.bat` to run it once.) Allow both Windows Firewall prompts on **Private** networks
    (go2rtc needs UDP 8555; the hub needs LAN multicast for camera discovery).
-6. Settings -> Power: never sleep when plugged in. For auto-start, put a shortcut to
-   `start-hub.bat` in `shell:startup`.
+6. Settings -> Power: never sleep when plugged in. Run only ONE copy of a hub at a time.

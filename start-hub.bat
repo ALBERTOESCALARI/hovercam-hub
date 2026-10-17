@@ -1,26 +1,21 @@
 @echo off
-REM HoverCam hub for Windows: starts go2rtc and the hub, restarts the hub if it stops.
-REM Put a shortcut to this file in shell:startup to run it when you sign in.
+REM HoverCam hub for Windows. Starts go2rtc + the hub and restarts the hub if it stops.
+REM Runs fine as a startup task (no window): output goes to hub.log.
+REM Install once as a task (admin terminal):
+REM   schtasks /Create /TN "HoverCam Hub" /TR "%USERPROFILE%\hovercam-hub\start-hub.bat" /SC ONSTART /DELAY 0001:00 /RU SYSTEM /RL HIGHEST /F
 cd /d "%~dp0"
-if "%HOVERCAM_API_URL%"=="" set HOVERCAM_API_URL=https://hovercam-api.onrender.com
+if "%HOVERCAM_API_URL%"=="" set HOVERCAM_API_URL=https://hovercam-api.hoverlayer.com
 if "%HOVERCAM_STATE_DIR%"=="" set HOVERCAM_STATE_DIR=state-prod
-
-if not exist go2rtc.exe (
-  echo go2rtc.exe is missing. Download go2rtc_win64.zip from
-  echo https://github.com/AlexxIT/go2rtc/releases/latest and put go2rtc.exe in this folder.
-  pause
-  exit /b 1
-)
+REM ffmpeg from winget lives in the user's WinGet Links folder; add it so this works before sign-in too.
+set "PATH=%~dp0..\AppData\Local\Microsoft\WinGet\Links;%PATH%"
+if not exist go2rtc.exe (echo go2rtc.exe missing - download go2rtc_win64.zip from GitHub releases & exit /b 1)
 if not exist .venv\Scripts\python.exe (
-  echo Setting up Python environment, one time...
   py -3.12 -m venv .venv || python -m venv .venv
   .venv\Scripts\python.exe -m pip install -e .
 )
-
 tasklist /FI "IMAGENAME eq go2rtc.exe" | find /I "go2rtc.exe" >nul || start "go2rtc" /min go2rtc.exe -config go2rtc.yaml
-
 :loop
-.venv\Scripts\python.exe -m hub
-echo Hub stopped. Restarting in 5 seconds (close this window to stop)...
-timeout /t 5 >nul
+echo %date% %time% starting hub >> hub.log
+.venv\Scripts\python.exe -m hub >> hub.log 2>&1
+ping -n 6 127.0.0.1 >nul
 goto loop
