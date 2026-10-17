@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-state/
+state*/
 *.egg-info/
 .pytest_cache/
 go2rtc

@@ -51,7 +51,13 @@ class Agent:
     async def _start_status_page(self) -> None:
         runner = web.AppRunner(status_page.make_app(lambda: self.state))
         await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", self.config.status_port).start()
+        try:
+            await web.TCPSite(runner, "0.0.0.0", self.config.status_port).start()
+        except OSError as exc:
+            # Optional convenience page; never let it stop the hub.
+            log.warning("status page disabled (port %s: %s)", self.config.status_port,
+                        exc.strerror or exc)
+            return
         log.info("status page on http://<this-device>:%s", self.config.status_port)
 
     async def _ensure_registered(self) -> None:
