@@ -11,22 +11,50 @@ import base64
 import json
 import logging
 import random
+import secrets
+import time
+from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
 
-from hub import __version__, discovery, onvif, status_page
+from hub import __version__, discovery, onvif, recorder, status_page
 from hub.config import Config
 from hub.go2rtc import Go2RTC, Go2RTCError
+from hub.recorder import RecorderClient, RecorderError
 from hub.state import HubState, StateStore
+from hub.xmframe import Unwrapper
 
 log = logging.getLogger("hovercam.hub")
 
 
 class CommandError(Exception):
     pass
+
+
+PLAYBACK_BUFFER = 48 * 1024 * 1024   # pause pulling from the recorder beyond this
+PLAYBACK_IDLE_S = 90                 # drop a playback nobody is watching
+MAX_PLAYBACKS = 3
+
+
+class Playback:
+    """One recording being streamed: recorder -> unwrap -> local HTTP feed -> go2rtc."""
+
+    def __init__(self) -> None:
+        self.chunks: deque[bytes] = deque()
+        self.buffered = 0
+        self.data = asyncio.Event()
+        self.space = asyncio.Event()
+        self.space.set()
+        self.ready = asyncio.Event()
+        self.done = False
+        self.error: str | None = None
+        self.info: dict = {}
+        self.readers = 0
+        self.created = self.last_active = time.monotonic()
+        self.task: asyncio.Task | None = None
 
 
 class Agent:
@@ -37,6 +65,7 @@ class Agent:
         self.session: aiohttp.ClientSession | None = None
         self.go2rtc: Go2RTC | None = None
         self._tasks: set[asyncio.Task] = set()
+        self.playbacks: dict[str, Playback] = {}
 
     # ---- lifecycle -------------------------------------------------------------------
 
@@ -47,10 +76,11 @@ class Agent:
             await self._start_status_page()
             await self._ensure_registered()
             await self._restore_streams()
-            await asyncio.gather(self._pairing_watch(), self._socket_forever())
+            await asyncio.gather(self._pairing_watch(), self._socket_forever(),
+                                 self._playback_janitor())
 
     async def _start_status_page(self) -> None:
-        runner = web.AppRunner(status_page.make_app(lambda: self.state))
+        runner = web.AppRunner(status_page.make_app(lambda: self.state, self._serve_playback))
         await runner.setup()
         try:
             await web.TCPSite(runner, "0.0.0.0", self.config.status_port).start()
@@ -144,6 +174,9 @@ class Agent:
             except (Go2RTCError, aiohttp.ClientError):
                 pass
         self.state.cameras.clear()
+        self.state.recorders.clear()
+        for key in list(self.playbacks):
+            await self._drop_playback(key)
         self.state.paired = False
         self.state.pairing_expires_at = None
         self.store.save(self.state)
@@ -198,9 +231,10 @@ class Agent:
         if request_id is None:
             # Unsolicited notice from the cloud.
             if message.get("type") == "status":
-                if (message.get("data") or {}).get("paired"):
+                paired = (message.get("data") or {}).get("paired")
+                if paired is True:
                     self._mark_paired()
-                elif self.state.paired:
+                elif paired is False and self.state.paired:   # only an explicit unpair
                     await self._unpaired()
             return
         try:
@@ -245,13 +279,174 @@ class Agent:
             self.store.save(self.state)
             return {}
         if command == "webrtc.offer":
-            key = self._known(data["stream_key"])
+            key = data["stream_key"]
+            if key not in self.state.cameras and key not in self.playbacks:
+                raise CommandError("stream not found on this hub")
+            if key in self.playbacks:
+                self.playbacks[key].last_active = time.monotonic()
             return {"sdp": await self.go2rtc.webrtc_answer(key, data["sdp"])}
+        if command.startswith("recorder.") or command.startswith("playback."):
+            try:
+                return await self._recorder_command(command, data)
+            except RecorderError as exc:
+                raise CommandError(str(exc)) from None
         if command == "snapshot":
             key = self._known(data["stream_key"])
             jpeg = await self.go2rtc.snapshot(key)
             return {"jpeg_b64": base64.b64encode(jpeg).decode()}
         raise CommandError(f"unknown command {command!r}")
+
+    # ---- recorders (NVR/DVR) ---------------------------------------------------------
+
+    def _recorder(self, recorder_id: str) -> dict:
+        rec = self.state.recorders.get(recorder_id)
+        if rec is None:
+            raise CommandError("recorder not found on this hub")
+        return rec
+
+    def _client(self, rec: dict) -> RecorderClient:
+        return RecorderClient(rec["host"], rec["username"], rec["password"])
+
+    async def _recorder_command(self, command: str, data: dict) -> dict:
+        if command == "recorder.scan":
+            hosts = await recorder.scan()
+            cams = {urlparse(u).hostname for u in self.state.cameras.values()}
+            recs = {r["host"] for r in self.state.recorders.values()}
+            return {"hosts": [{"address": h, "camera": h in cams, "added": h in recs}
+                              for h in hosts]}
+        if command == "recorder.add":
+            rec = {"host": data["host"], "username": data["username"],
+                   "password": data.get("password", "")}
+            async with self._client(rec) as c:
+                described = await c.describe()
+            self.state.recorders[data["recorder_id"]] = rec
+            self.store.save(self.state)
+            return described
+        if command == "recorder.remove":
+            self.state.recorders.pop(data["recorder_id"], None)
+            self.store.save(self.state)
+            return {}
+        if command == "recorder.describe":
+            async with self._client(self._recorder(data["recorder_id"])) as c:
+                return await c.describe()
+        if command == "recorder.files":
+            async with self._client(self._recorder(data["recorder_id"])) as c:
+                files = await c.files(int(data["channel"]), *recorder.day_bounds(data["day"]))
+            return {"files": files}
+        if command == "playback.start":
+            return await self._start_playback(data)
+        if command == "playback.stop":
+            await self._drop_playback(data["stream_key"])
+            return {}
+        raise CommandError(f"unknown command {command!r}")
+
+    async def _start_playback(self, data: dict) -> dict:
+        rec = self._recorder(data["recorder_id"])
+        while len(self.playbacks) >= MAX_PLAYBACKS:          # keep the PC from overloading
+            oldest = min(self.playbacks, key=lambda k: self.playbacks[k].created)
+            await self._drop_playback(oldest)
+        key = f"pb_{secrets.token_hex(6)}"
+        pb = Playback()
+        self.playbacks[key] = pb
+        pb.task = asyncio.create_task(
+            self._pull_recording(pb, rec, data["file"], data["start"], data["end"]))
+        try:
+            await asyncio.wait_for(pb.ready.wait(), 25)
+        except asyncio.TimeoutError:
+            pb.error = "the recorder did not send video in time"
+        if not pb.info:
+            await self._drop_playback(key)
+            raise CommandError(pb.error or "no video in that time range")
+        fmt = "hevc" if pb.info.get("codec") == "hevc" else "h264"
+        fps = int(pb.info.get("fps") or 15)
+        source = (
+            f"exec:ffmpeg -hide_banner -loglevel error -re -f {fmt} -framerate {fps} "
+            f"-i http://127.0.0.1:{self.config.status_port}/playback/{key} -an "
+            f"-c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline "
+            f"-pix_fmt yuv420p -vf scale=-2:720 -g {fps * 2} -f rtsp {{output}}"
+        )
+        await self.go2rtc.add_stream(key, source)
+        started = pb.info.get("started")
+        return {"stream_key": key, "codec": pb.info.get("codec"), "fps": fps,
+                "started": started.isoformat() if started else None}
+
+    async def _pull_recording(self, pb: Playback, rec: dict, file: str, start: str,
+                              end: str) -> None:
+        try:
+            async with self._client(rec) as c:
+                unwrap = Unwrapper()
+                async for raw in c.stream(file, start, end):
+                    video = unwrap.feed(raw)
+                    if video:
+                        pb.chunks.append(video)
+                        pb.buffered += len(video)
+                        pb.data.set()
+                    if unwrap.info["key_frames"] and not pb.ready.is_set():
+                        pb.info = dict(unwrap.info)
+                        pb.ready.set()
+                    while pb.buffered > PLAYBACK_BUFFER:     # viewer is slower: wait
+                        pb.space.clear()
+                        await pb.space.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            pb.error = str(exc) or exc.__class__.__name__
+            log.warning("playback stopped: %s", pb.error)
+        finally:
+            pb.done = True
+            pb.data.set()
+            pb.ready.set()
+
+    async def _serve_playback(self, request: web.Request) -> web.StreamResponse:
+        if request.remote not in ("127.0.0.1", "::1"):
+            raise web.HTTPForbidden()
+        pb = self.playbacks.get(request.match_info["key"])
+        if pb is None:
+            raise web.HTTPNotFound()
+        resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream"})
+        await resp.prepare(request)
+        pb.readers += 1
+        try:
+            while True:
+                while pb.chunks:
+                    chunk = pb.chunks.popleft()
+                    pb.buffered -= len(chunk)
+                    pb.space.set()
+                    await resp.write(chunk)
+                    pb.last_active = time.monotonic()
+                if pb.done:
+                    break
+                pb.data.clear()
+                try:
+                    await asyncio.wait_for(pb.data.wait(), 60)
+                except asyncio.TimeoutError:
+                    break
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            pb.readers -= 1
+            pb.last_active = time.monotonic()
+        return resp
+
+    async def _drop_playback(self, key: str) -> None:
+        pb = self.playbacks.pop(key, None)
+        if pb is None:
+            return
+        if pb.task is not None:
+            pb.task.cancel()
+        try:
+            await self.go2rtc.remove_stream(key)
+        except (Go2RTCError, aiohttp.ClientError):
+            pass
+
+    async def _playback_janitor(self) -> None:
+        while True:
+            await asyncio.sleep(20)
+            now = time.monotonic()
+            for key, pb in list(self.playbacks.items()):
+                if pb.readers == 0 and now - pb.last_active > PLAYBACK_IDLE_S:
+                    log.info("closing idle playback %s", key)
+                    await self._drop_playback(key)
 
     def _known(self, key: str) -> str:
         if key not in self.state.cameras:

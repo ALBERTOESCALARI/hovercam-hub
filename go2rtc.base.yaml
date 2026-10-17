@@ -1,0 +1,13 @@
+# go2rtc settings for the HoverCam hub. Start scripts copy this to go2rtc.yaml (git-ignored)
+# on every start, because go2rtc writes the streams the hub adds (with camera logins) into
+# its config file. Streams are re-added by the hub at startup, so none are listed here.
+api:
+  listen: "127.0.0.1:1984"   # only the agent on this machine talks to go2rtc
+rtsp:
+  listen: "127.0.0.1:8554"    # local only: recording playback is re-encoded through it
+webrtc:
+  listen: ":8555"
+  candidates:
+    - stun:8555               # discover public IP for remote viewers
+  ice_servers:
+    - urls: [ "stun:stun.l.google.com:19302" ]

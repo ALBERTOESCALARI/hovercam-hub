@@ -15,6 +15,8 @@ class HubState:
     pairing_code: str | None = None
     pairing_expires_at: str | None = None
     cameras: dict[str, str] = field(default_factory=dict)  # stream_key -> rtsp_url
+    # recorder_id -> {"host", "username", "password"}; like camera URLs, stays on the hub only
+    recorders: dict[str, dict] = field(default_factory=dict)
 
 
 class StateStore:

@@ -7,7 +7,7 @@ services:
     network_mode: host
     restart: unless-stopped
     volumes:
-      - ./go2rtc.yaml:/config/go2rtc.yaml:ro
+      - ./go2rtc.base.yaml:/config/go2rtc.yaml:ro
 
   hub:
     build: .

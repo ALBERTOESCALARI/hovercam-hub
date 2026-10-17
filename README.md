@@ -26,7 +26,7 @@ Host networking is required: discovery uses LAN multicast and WebRTC uses UDP 85
 
 ```bash
 brew install go2rtc     # or download the binary from the go2rtc releases page
-go2rtc -config go2rtc.yaml &
+cp go2rtc.base.yaml go2rtc.yaml && go2rtc -config go2rtc.yaml &
 python3 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
 HOVERCAM_API_URL=http://localhost:8000 python -m hub
 pytest

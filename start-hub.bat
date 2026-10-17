@@ -13,7 +13,8 @@ if not exist .venv\Scripts\python.exe (
   py -3.12 -m venv .venv || python -m venv .venv
   .venv\Scripts\python.exe -m pip install -e .
 )
-tasklist /FI "IMAGENAME eq go2rtc.exe" | find /I "go2rtc.exe" >nul || start "go2rtc" /min go2rtc.exe -config go2rtc.yaml
+REM Fresh go2rtc config each start (go2rtc saves camera logins into it; the hub re-adds streams).
+tasklist /FI "IMAGENAME eq go2rtc.exe" | find /I "go2rtc.exe" >nul || (copy /Y go2rtc.base.yaml go2rtc.yaml >nul & start "go2rtc" /min go2rtc.exe -config go2rtc.yaml)
 :loop
 echo %date% %time% starting hub >> hub.log
 .venv\Scripts\python.exe -m hub >> hub.log 2>&1

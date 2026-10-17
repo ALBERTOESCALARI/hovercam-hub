@@ -8,7 +8,7 @@ from aiohttp import web
 from hub.state import HubState
 
 
-def make_app(get_state) -> web.Application:
+def make_app(get_state, playback_handler=None) -> web.Application:
     async def index(_request: web.Request) -> web.Response:
         state: HubState = get_state()
         if state.paired:
@@ -30,4 +30,7 @@ def make_app(get_state) -> web.Application:
 
     app = web.Application()
     app.router.add_get("/", index)
+    if playback_handler is not None:
+        # Local-only feed of unwrapped recorder video that go2rtc's ffmpeg reads from.
+        app.router.add_get("/playback/{key}", playback_handler)
     return app
