@@ -168,10 +168,12 @@ class Agent:
                         log.error("cloud rejected hub credentials; delete state to re-register")
             except aiohttp.ClientError as exc:
                 log.warning("cloud connection failed: %s", exc)
-            delay = backoff + random.uniform(0, backoff / 2)
+            # Short, capped backoff: a server deploy takes ~1-3 min and the hub should be
+            # back within seconds of it, not minutes.
+            delay = backoff + random.uniform(0, 2)
             log.info("reconnecting in %.0fs", delay)
             await asyncio.sleep(delay)
-            backoff = min(backoff * 2, 60.0)
+            backoff = min(backoff * 2, 30.0)
 
     async def _handle(self, ws: aiohttp.ClientWebSocketResponse, message: dict) -> None:
         request_id = message.get("id")
