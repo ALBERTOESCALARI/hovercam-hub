@@ -133,6 +133,23 @@ class Agent:
             self.store.save(self.state)
             log.info("hub is paired")
 
+    async def _unpaired(self) -> None:
+        """The owner removed this hub (or deleted their account): forget every camera
+        URL/password and offer a fresh pairing code."""
+        log.info("hub was removed from its home; clearing cameras and re-pairing")
+        for key in list(self.state.cameras):
+            try:
+                await self.go2rtc.remove_stream(key)
+            except (Go2RTCError, aiohttp.ClientError):
+                pass
+        self.state.cameras.clear()
+        self.state.paired = False
+        self.state.pairing_expires_at = None
+        self.store.save(self.state)
+        task = asyncio.create_task(self._pairing_watch())  # issues a new code right away
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     async def _restore_streams(self) -> None:
         for key, url in self.state.cameras.items():
             try:
@@ -179,8 +196,11 @@ class Agent:
         request_id = message.get("id")
         if request_id is None:
             # Unsolicited notice from the cloud.
-            if message.get("type") == "status" and (message.get("data") or {}).get("paired"):
-                self._mark_paired()
+            if message.get("type") == "status":
+                if (message.get("data") or {}).get("paired"):
+                    self._mark_paired()
+                elif self.state.paired:
+                    await self._unpaired()
             return
         try:
             data = await self._dispatch(message.get("type", ""), message.get("data") or {})
