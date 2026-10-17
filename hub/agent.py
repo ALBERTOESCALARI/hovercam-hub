@@ -12,11 +12,12 @@ import json
 import logging
 import random
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
 
-from hub import __version__, discovery, status_page
+from hub import __version__, discovery, onvif, status_page
 from hub.config import Config
 from hub.go2rtc import Go2RTC, Go2RTCError
 from hub.state import HubState, StateStore
@@ -218,7 +219,23 @@ class Agent:
         if command == "ping":
             return {"agent_version": __version__}
         if command == "discover":
-            return {"cameras": await discovery.discover()}
+            cameras = await discovery.discover()
+            known = {urlparse(u).hostname for u in self.state.cameras.values()}
+            for cam in cameras:
+                cam["added"] = cam["address"] in known
+            return {"cameras": cameras}
+        if command == "camera.add_onvif":
+            try:
+                found = await onvif.OnvifCamera(
+                    self.session, data["xaddr"], data.get("username", ""),
+                    data.get("password", "")).resolve()
+            except onvif.OnvifError as exc:
+                raise CommandError(str(exc)) from None
+            await self._camera_add(data["stream_key"], found["rtsp_url"])
+            p = found["profile"]
+            return {"manufacturer": found["manufacturer"], "model": found["model"],
+                    "stream": f"{p['name'] or p['token']} {p['encoding'] or ''} "
+                              f"{p['width']}x{p['height']}".strip()}
         if command == "camera.add":
             return await self._camera_add(data["stream_key"], data["rtsp_url"])
         if command == "camera.remove":
