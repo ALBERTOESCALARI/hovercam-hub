@@ -46,3 +46,16 @@ directly there and use Docker on Linux.
 | `HOVERCAM_STATUS_PORT` | `8099` |
 
 To re-pair from scratch, stop the hub and delete `state/hub_state.json`.
+
+## Run on Windows
+
+1. Install Python 3.12 (tick "Add python.exe to PATH"), Git, and ffmpeg:
+   `winget install Python.Python.3.12 Git.Git Gyan.FFmpeg` (then open a new terminal).
+2. `git clone https://github.com/ALBERTOESCALARI/hovercam-hub.git` and `cd hovercam-hub`.
+3. Download `go2rtc_win64.zip` from the go2rtc releases page; put `go2rtc.exe` in the folder.
+4. To keep an existing pairing, copy `state-prod\hub_state.json` from the old machine into
+   `state-prod\` here (and stop the hub there first). Otherwise it registers as a new hub.
+5. Double-click `start-hub.bat`. Allow both Windows Firewall prompts on **Private** networks
+   (go2rtc needs UDP 8555; the hub needs LAN multicast for camera discovery).
+6. Settings -> Power: never sleep when plugged in. For auto-start, put a shortcut to
+   `start-hub.bat` in `shell:startup`.
