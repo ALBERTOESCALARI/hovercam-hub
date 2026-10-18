@@ -10,3 +10,4 @@ go2rtc.exe
 hub.log
 .DS_Store
 go2rtc.yaml
+nvr_settings.json
