@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from hub import __version__, discovery, onvif, recorder, status_page
+from hub import __version__, discovery, imaging, onvif, recorder, status_page
 from hub.config import Config
 from hub.go2rtc import Go2RTC, Go2RTCError
 from hub.recorder import RecorderClient, RecorderError
@@ -63,6 +63,7 @@ class Agent:
         self.config = config
         self.store = StateStore(config.state_dir)
         self.state: HubState = self.store.load()
+        self._imaging: dict[str, imaging.CameraImaging] = {}  # stream_key -> settings client
         self.session: aiohttp.ClientSession | None = None
         self.go2rtc: Go2RTC | None = None
         self._tasks: set[asyncio.Task] = set()
@@ -277,6 +278,7 @@ class Agent:
             key = data["stream_key"]
             await self.go2rtc.remove_stream(key)
             self.state.cameras.pop(key, None)
+            self._imaging.pop(key, None)
             self.store.save(self.state)
             return {}
         if command == "webrtc.offer":
@@ -291,6 +293,8 @@ class Agent:
                 return await self._recorder_command(command, data)
             except RecorderError as exc:
                 raise CommandError(str(exc)) from None
+        if command in ("camera.image.get", "camera.image.set"):
+            return await self._camera_image(command, data)
         if command == "snapshot":
             key = self._known(data["stream_key"])
             jpeg = await self.go2rtc.snapshot(key)
@@ -480,6 +484,24 @@ class Agent:
                 if pb.readers == 0 and now - pb.last_active > PLAYBACK_IDLE_S:
                     log.info("closing idle playback %s", key)
                     await self._drop_playback(key)
+
+    async def _camera_image(self, command: str, data: dict) -> dict:
+        """Picture settings (brightness, color, ...) via the camera's ONVIF imaging service.
+        The login comes from the camera's RTSP URL, which only this hub stores."""
+        key = self._known(data["stream_key"])
+        try:
+            client = self._imaging.get(key)
+            if client is None:
+                host, user, password = imaging.login_from_rtsp(self.state.cameras[key])
+                xaddr = await imaging.find_xaddr(self.session, host)
+                client = await imaging.CameraImaging.connect(self.session, xaddr, user, password)
+                self._imaging[key] = client
+            if command == "camera.image.set":
+                await client.set(data.get("settings") or {})
+            return await client.get()
+        except imaging.OnvifError as exc:
+            self._imaging.pop(key, None)  # rediscover next time (camera moved, login changed)
+            raise CommandError(str(exc)) from None
 
     def _known(self, key: str) -> str:
         if key not in self.state.cameras:

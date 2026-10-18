@@ -146,14 +146,18 @@ class OnvifCamera:
             raise OnvifError(f"camera refused the request: {reason[:120]}")
         return root
 
-    async def resolve(self) -> dict:
-        try:  # sync to the camera's clock so the digest isn't rejected as stale
+    async def sync_clock(self) -> None:
+        """Match the camera's clock so the password digest isn't rejected as stale."""
+        try:
             cam_now = parse_camera_time(
                 await self._call(self.xaddr, "<tds:GetSystemDateAndTime/>", auth=False))
             if cam_now:
                 self.clock_offset = cam_now - datetime.now(timezone.utc)
         except OnvifError:
             pass
+
+    async def resolve(self) -> dict:
+        await self.sync_clock()
 
         info = {"manufacturer": None, "model": None}
         try:
