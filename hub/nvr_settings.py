@@ -241,3 +241,41 @@ async def apply(c: RecorderClient, change: dict) -> dict:
     if change.get("reboot"):
         await c.reboot()
     return {"restart_needed": 603 in rets}
+
+
+OVERLAY_KEYS = ("title", "show_title", "show_time")
+
+
+async def apply_to_camera(host: str, username: str, password: str, change: dict) -> None:
+    """The name and clock drawn on the video come from the camera itself; the recorder
+    just records what the camera sends. So overlay changes also go to the camera (same
+    DVRIP protocol, single channel). Raises RecorderError if the camera won't take them."""
+    async with RecorderClient(host, username, password) as cam:
+        if "title" in change:
+            title = clean_title(change["title"])
+            try:
+                await cam.set_titles([title])
+            except RecorderError:
+                pass  # some cameras only keep it in the video widget, below
+        if not ({"title", "show_title", "show_time"} & change.keys()):
+            return
+        widgets = await cam.config_get("AVEnc.VideoWidget")
+        items = widgets if isinstance(widgets, list) else [widgets]
+        w = items[0]
+        if "title" in change and isinstance(w.get("ChannelTitle"), dict):
+            w["ChannelTitle"]["Name"] = clean_title(change["title"])
+        for key, attr in (("show_title", "ChannelTitleAttribute"),
+                          ("show_time", "TimeTitleAttribute")):
+            if key in change and isinstance(w.get(attr), dict):
+                w[attr]["EncodeBlend"] = bool(change[key])
+                w[attr]["PreviewBlend"] = bool(change[key])
+        await cam.config_set("AVEnc.VideoWidget", items if isinstance(widgets, list) else w)
+
+
+async def read_camera_overlay(host: str, username: str, password: str) -> dict:
+    """What the camera itself draws on its video: {"show_title", "show_time"}."""
+    async with RecorderClient(host, username, password, timeout=5) as cam:
+        widgets = await cam.config_get("AVEnc.VideoWidget")
+    w = (widgets[0] if isinstance(widgets, list) and widgets else widgets) or {}
+    return {"show_title": (w.get("ChannelTitleAttribute") or {}).get("EncodeBlend"),
+            "show_time": (w.get("TimeTitleAttribute") or {}).get("EncodeBlend")}

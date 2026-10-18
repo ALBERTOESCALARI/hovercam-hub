@@ -190,3 +190,27 @@ def test_recording_modes():
     night = record()
     night["TimeSection"][0][0] = "1 20:00:00-24:00:00"
     assert nvr_settings.recording_mode(night) == "custom"
+
+
+def test_overlay_changes_go_to_the_camera_itself():
+    cam = FakeRecorder()
+    cam.cfg = {"ChannelTitle": ["Patio Door"], "AVEnc.VideoWidget": [widget("Patio Door")]}
+
+    async def go():
+        server = await asyncio.start_server(cam.handle, "127.0.0.1", 0)
+        import hub.recorder as rec
+        old, rec.PORT = rec.PORT, server.sockets[0].getsockname()[1]
+        try:
+            await nvr_settings.apply_to_camera("127.0.0.1", "u", "p",
+                                               {"channel": 7, "show_title": False})
+            await nvr_settings.apply_to_camera("127.0.0.1", "u", "p",
+                                               {"channel": 7, "title": "Living room"})
+        finally:
+            rec.PORT = old
+            server.close()
+
+    asyncio.run(go())
+    w = cam.cfg["AVEnc.VideoWidget"][0]
+    assert w["ChannelTitleAttribute"]["EncodeBlend"] is False
+    assert w["TimeTitleAttribute"]["EncodeBlend"] is True
+    assert w["ChannelTitle"]["Name"] == "Living room" and cam.cfg["ChannelTitle"] == ["Living room"]

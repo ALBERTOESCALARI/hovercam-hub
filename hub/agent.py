@@ -362,12 +362,19 @@ class Agent:
                 return await c.describe()
         if command == "recorder.settings.get":
             async with self._client(self._recorder(data["recorder_id"])) as c:
-                return await nvr_settings.read(c, self._camera_ips())
+                settings = await nvr_settings.read(c, self._camera_ips())
+            await self._camera_overlays(settings)
+            return settings
         if command == "recorder.settings.set":
+            change = data.get("change") or {}
             async with self._client(self._recorder(data["recorder_id"])) as c:
-                result = await nvr_settings.apply(c, data.get("change") or {})
-                if not (data.get("change") or {}).get("reboot"):
+                result = await nvr_settings.apply(c, change)
+                if not change.get("reboot"):
                     result["settings"] = await nvr_settings.read(c, self._camera_ips())
+            if set(nvr_settings.OVERLAY_KEYS) & change.keys() and "settings" in result:
+                result["camera"] = await self._overlay_to_camera(result["settings"], change)
+            if "settings" in result:
+                await self._camera_overlays(result["settings"])
             return result
         if command == "recorder.files":
             async with self._client(self._recorder(data["recorder_id"])) as c:
@@ -379,6 +386,46 @@ class Agent:
             await self._drop_playback(data["stream_key"])
             return {}
         raise CommandError(f"unknown command {command!r}")
+
+    def _camera_login(self, ip: str | None) -> tuple[str, str, str] | None:
+        url = next((u for u in self.state.cameras.values() if ip and urlparse(u).hostname == ip),
+                   None)
+        return imaging.login_from_rtsp(url) if url else None
+
+    async def _camera_overlays(self, settings: dict) -> None:
+        """Show what each camera really draws on its video (the camera decides, not the
+        recorder) for the cameras this hub can log in to; others keep the recorder's value."""
+        async def one(chan: dict) -> None:
+            login = self._camera_login(chan.get("ip"))
+            if login is None:
+                return
+            try:
+                chan.update({k: v for k, v in
+                             (await nvr_settings.read_camera_overlay(*login)).items()
+                             if v is not None})
+                chan["overlay_from_camera"] = True
+            except (RecorderError, OSError, asyncio.TimeoutError):
+                pass
+
+        await asyncio.gather(*(one(ch) for ch in settings.get("channels") or []))
+
+    async def _overlay_to_camera(self, settings: dict, change: dict) -> str:
+        """Send name/clock overlay changes to the camera itself (it draws them). Returns
+        "ok", "no_login" (that camera isn't in HoverCam's live view, so the hub has no
+        login for it) or the camera's error."""
+        chans = settings.get("channels") or []
+        ch = change.get("channel")
+        ip = chans[ch].get("ip") if isinstance(ch, int) and 0 <= ch < len(chans) else None
+        login = self._camera_login(ip)
+        if login is None:
+            return "no_login"
+        host, user, password = login
+        try:
+            await nvr_settings.apply_to_camera(host, user, password, change)
+            return "ok"
+        except RecorderError as exc:
+            log.info("camera %s overlay change failed: %s", host, exc)
+            return str(exc)
 
     def _camera_ips(self) -> dict[str, str]:
         return {key: urlparse(url).hostname or "" for key, url in self.state.cameras.items()}
