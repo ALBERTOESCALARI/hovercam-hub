@@ -8,6 +8,8 @@ if "%HOVERCAM_API_URL%"=="" set HOVERCAM_API_URL=https://hovercam-api.hoverlayer
 if "%HOVERCAM_STATE_DIR%"=="" set HOVERCAM_STATE_DIR=state-prod
 REM ffmpeg from winget lives in the user's WinGet Links folder; add it so this works before sign-in too.
 set "PATH=%~dp0..\AppData\Local\Microsoft\WinGet\Links;%PATH%"
+REM git (for self-update from GitHub) when installed with winget/Git for Windows.
+set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
 if not exist go2rtc.exe (echo go2rtc.exe missing - download go2rtc_win64.zip from GitHub releases & exit /b 1)
 if not exist .venv\Scripts\python.exe (
   py -3.12 -m venv .venv || python -m venv .venv

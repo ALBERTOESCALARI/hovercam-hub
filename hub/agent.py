@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from hub import __version__, discovery, imaging, onvif, recorder, status_page
+from hub import __version__, discovery, imaging, onvif, recorder, status_page, updater
 from hub.config import Config
 from hub.go2rtc import Go2RTC, Go2RTCError
 from hub.recorder import RecorderClient, RecorderError
@@ -68,6 +68,7 @@ class Agent:
         self.go2rtc: Go2RTC | None = None
         self._tasks: set[asyncio.Task] = set()
         self.playbacks: dict[str, Playback] = {}
+        self.commit: str | None = None
 
     # ---- lifecycle -------------------------------------------------------------------
 
@@ -78,8 +79,12 @@ class Agent:
             await self._start_status_page()
             await self._ensure_registered()
             await self._restore_streams()
+            self.commit = await updater.current_commit()
+            if self.commit:
+                log.info("running version %s (%s)", __version__, self.commit)
             await asyncio.gather(self._pairing_watch(), self._socket_forever(),
-                                 self._playback_janitor())
+                                 self._playback_janitor(),
+                                 updater.watch(busy=lambda: bool(self.playbacks)))
 
     async def _start_status_page(self) -> None:
         runner = web.AppRunner(status_page.make_app(lambda: self.state, self._serve_playback))
@@ -253,7 +258,7 @@ class Agent:
     async def _dispatch(self, command: str, data: dict) -> dict:
         self._mark_paired()  # only a claimed hub receives commands
         if command == "ping":
-            return {"agent_version": __version__}
+            return {"agent_version": __version__, "commit": self.commit}
         if command == "discover":
             cameras = await discovery.discover()
             known = {urlparse(u).hostname for u in self.state.cameras.values()}

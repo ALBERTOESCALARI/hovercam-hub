@@ -60,3 +60,22 @@ To re-pair from scratch, stop the hub and delete `state/hub_state.json`.
    then `schtasks /Run /TN "HoverCam Hub"`. (Or double-click `start-hub.bat` to run it once.) Allow both Windows Firewall prompts on **Private** networks
    (go2rtc needs UDP 8555; the hub needs LAN multicast for camera discovery).
 6. Settings -> Power: never sleep when plugged in. Run only ONE copy of a hub at a time.
+
+## Self-update
+
+When the hub runs from a git clone it checks GitHub every 10 minutes (`HOVERCAM_UPDATE_MINUTES`),
+takes new commits on `main`, and exits so the start script restarts it on the new code (it waits
+while a recording is being watched, up to an hour). Turn it off with `HOVERCAM_AUTO_UPDATE=0`.
+
+Windows: install Git (`winget install --id Git.Git -e`), then in the hub folder link it to the repo
+with a read-only fine-grained token (Contents: Read on this repo only):
+
+```powershell
+git config --global --add safe.directory C:/Users/<you>/hovercam-hub
+git init -b main
+git remote add origin https://<github-user>:<token>@github.com/<github-user>/hovercam-hub.git
+git fetch origin main
+git reset --hard origin/main   # ignored files (state-prod, .venv, go2rtc.exe, logs) are kept
+```
+
+Anyone who can push to the repo can run code on the hub, so keep write access to yourself.
