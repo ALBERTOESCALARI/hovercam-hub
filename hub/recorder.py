@@ -1,7 +1,7 @@
 """Async client for Xiongmai / XMEye recorders (NVR/DVR) over their DVRIP port (34567).
 
-Read-only use: log in, read model and channel names, list recordings, stream a recording
-for a time range, and listen for alarms (motion, video loss). Protocol notes: 20-byte header (0xFF, version, session, sequence, msg id,
+Log in, read model and channel names, list recordings, stream a recording for a time
+range, listen for alarms (motion, video loss), and read/change settings (see nvr_settings). Protocol notes: 20-byte header (0xFF, version, session, sequence, msg id,
 length) + JSON body terminated by "\\n\\0"; video arrives as msg 1426 packets until an empty one.
 """
 
@@ -103,6 +103,41 @@ class RecorderClient:
     async def _get(self, name: str, code: int):
         r = await self._call(code, {"Name": name, "SessionID": "0x%08X" % self.session})
         return r.get(name)
+
+    # ---- settings ----------------------------------------------------------------------
+    # Ret 100 = OK, 515 = OK (upgrade notice), 603 = saved, takes effect after a restart.
+    OK = (100, 515, 603)
+
+    async def config_get(self, name: str, code: int = 1042):
+        r = await self._call(code, {"Name": name, "SessionID": "0x%08X" % self.session})
+        if r.get("Ret") not in self.OK or name not in r:
+            raise RecorderError(f"the recorder doesn't offer {name} (code {r.get('Ret')})")
+        return r[name]
+
+    async def config_set(self, name: str, value, code: int = 1040) -> int:
+        r = await self._call(code, {"Name": name, name: value,
+                                    "SessionID": "0x%08X" % self.session})
+        if r.get("Ret") not in self.OK:
+            raise RecorderError(f"the recorder refused the change to {name} "
+                                f"(code {r.get('Ret')})")
+        return r["Ret"]
+
+    async def set_titles(self, titles: list[str]) -> int:
+        return await self.config_set("ChannelTitle", titles, code=1046)
+
+    async def get_time(self) -> datetime | None:
+        r = await self._call(1452, {"Name": "OPTimeQuery", "SessionID": "0x%08X" % self.session})
+        try:
+            return datetime.strptime(str(r.get("OPTimeQuery")), FMT)
+        except ValueError:
+            return None
+
+    async def set_time(self, when: datetime) -> int:
+        return await self.config_set("OPTimeSetting", when.strftime(FMT), code=1450)
+
+    async def reboot(self) -> None:
+        await self._send_only(1450, {"Name": "OPMachine", "OPMachine": {"Action": "Reboot"},
+                                     "SessionID": "0x%08X" % self.session})
 
     async def describe(self) -> dict:
         info = await self._get("SystemInfo", 1020) or {}

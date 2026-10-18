@@ -21,7 +21,9 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from hub import __version__, alarms, discovery, imaging, onvif, recorder, status_page, updater
+from hub import (
+    __version__, alarms, discovery, imaging, nvr_settings, onvif, recorder, status_page, updater,
+)
 from hub.config import Config
 from hub.go2rtc import Go2RTC, Go2RTCError
 from hub.recorder import RecorderClient, RecorderError
@@ -88,7 +90,7 @@ class Agent:
             if self.commit:
                 log.info("running version %s (%s)", __version__, self.commit)
             await asyncio.gather(self._pairing_watch(), self._socket_forever(),
-                                 self._playback_janitor(),
+                                 self._playback_janitor(), self._clock_keeper(),
                                  updater.watch(busy=lambda: bool(self.playbacks)))
 
     async def _start_status_page(self) -> None:
@@ -358,6 +360,15 @@ class Agent:
         if command == "recorder.describe":
             async with self._client(self._recorder(data["recorder_id"])) as c:
                 return await c.describe()
+        if command == "recorder.settings.get":
+            async with self._client(self._recorder(data["recorder_id"])) as c:
+                return await nvr_settings.read(c, self._camera_ips())
+        if command == "recorder.settings.set":
+            async with self._client(self._recorder(data["recorder_id"])) as c:
+                result = await nvr_settings.apply(c, data.get("change") or {})
+                if not (data.get("change") or {}).get("reboot"):
+                    result["settings"] = await nvr_settings.read(c, self._camera_ips())
+            return result
         if command == "recorder.files":
             async with self._client(self._recorder(data["recorder_id"])) as c:
                 files = await c.files(int(data["channel"]), *recorder.day_bounds(data["day"]))
@@ -368,6 +379,26 @@ class Agent:
             await self._drop_playback(data["stream_key"])
             return {}
         raise CommandError(f"unknown command {command!r}")
+
+    def _camera_ips(self) -> dict[str, str]:
+        return {key: urlparse(url).hostname or "" for key, url in self.state.cameras.items()}
+
+    async def _clock_keeper(self) -> None:
+        """Keep each recorder's clock right (recordings and alerts are stamped with it):
+        every 6 hours, set it to this PC's time if it is more than 90 seconds off."""
+        await asyncio.sleep(120)
+        while True:
+            for rid, rec in list(self.state.recorders.items()):
+                try:
+                    async with self._client(rec) as c:
+                        nvr = await c.get_time()
+                        off = (nvr - datetime.now()).total_seconds() if nvr else 0
+                        if abs(off) > 90:
+                            await c.set_time(datetime.now())
+                            log.info("set recorder %s clock (was %+.0fs off)", rec["host"], off)
+                except Exception as exc:  # noqa: BLE001 - never let this stop the hub
+                    log.info("recorder %s clock check skipped: %s", rec.get("host"), exc)
+            await asyncio.sleep(6 * 3600)
 
     async def _start_playback(self, data: dict) -> dict:
         rec = self._recorder(data["recorder_id"])
