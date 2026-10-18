@@ -1,7 +1,7 @@
 """Async client for Xiongmai / XMEye recorders (NVR/DVR) over their DVRIP port (34567).
 
 Read-only use: log in, read model and channel names, list recordings, stream a recording
-for a time range. Protocol notes: 20-byte header (0xFF, version, session, sequence, msg id,
+for a time range, and listen for alarms (motion, video loss). Protocol notes: 20-byte header (0xFF, version, session, sequence, msg id,
 length) + JSON body terminated by "\\n\\0"; video arrives as msg 1426 packets until an empty one.
 """
 
@@ -41,6 +41,7 @@ class RecorderClient:
         self._r: asyncio.StreamReader | None = None
         self._w: asyncio.StreamWriter | None = None
         self.session, self.seq = 0, 0
+        self.alive = 20  # seconds between keep-alives (the recorder says at login)
 
     async def __aenter__(self) -> RecorderClient:
         await self.connect()
@@ -97,6 +98,7 @@ class RecorderClient:
         if r.get("Ret") not in (100, 515):
             raise RecorderError(_ERRORS.get(r.get("Ret"), f"recorder refused login ({r.get('Ret')})"))
         self.session = int(r["SessionID"], 16)
+        self.alive = max(5, min(int(r.get("AliveInterval") or 20), 60))
 
     async def _get(self, name: str, code: int):
         r = await self._call(code, {"Name": name, "SessionID": "0x%08X" % self.session})
@@ -150,6 +152,33 @@ class RecorderClient:
                 continue
             first = False
             yield data
+
+
+    async def alarms(self) -> AsyncIterator[dict]:
+        """Subscribe to the recorder's alarms (motion, video loss, ...) and yield each
+        AlarmInfo as it arrives, e.g. {"Channel": 0, "Event": "VideoMotion",
+        "StartTime": "2026-10-18 10:40:12", "Status": "Start"}. Sends keep-alives so the
+        recorder doesn't drop the session. Returns when the connection ends."""
+        sid = "0x%08X" % self.session
+        await self._send_only(1500, {"Name": "", "SessionID": sid})   # guard / subscribe
+        while True:
+            try:
+                msgid, payload = await self._read_packet(timeout=self.alive)
+            except asyncio.TimeoutError:
+                await self._send_only(1006, {"Name": "KeepAlive", "SessionID": sid})
+                continue
+            except (asyncio.IncompleteReadError, ConnectionError, OSError):
+                return
+            if msgid != 1504:
+                continue  # subscribe / keep-alive replies
+            text = payload.rstrip(b"\x00\x0a").decode("utf-8", "replace")
+            try:
+                body = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            info = body.get("AlarmInfo") or body.get(body.get("Name", "")) or {}
+            if isinstance(info, dict) and info:
+                yield info
 
 
 def local_subnet() -> ipaddress.IPv4Network | None:

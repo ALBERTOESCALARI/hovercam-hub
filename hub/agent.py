@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from hub import __version__, discovery, imaging, onvif, recorder, status_page, updater
+from hub import __version__, alarms, discovery, imaging, onvif, recorder, status_page, updater
 from hub.config import Config
 from hub.go2rtc import Go2RTC, Go2RTCError
 from hub.recorder import RecorderClient, RecorderError
@@ -69,6 +69,8 @@ class Agent:
         self._tasks: set[asyncio.Task] = set()
         self.playbacks: dict[str, Playback] = {}
         self.commit: str | None = None
+        self.ws: aiohttp.ClientWebSocketResponse | None = None
+        self.alarms = alarms.AlarmWatcher(self._emit_event)
 
     # ---- lifecycle -------------------------------------------------------------------
 
@@ -79,6 +81,9 @@ class Agent:
             await self._start_status_page()
             await self._ensure_registered()
             await self._restore_streams()
+            if self.state.paired:
+                for rid, rec in self.state.recorders.items():
+                    self.alarms.start(rid, rec)
             self.commit = await updater.current_commit()
             if self.commit:
                 log.info("running version %s (%s)", __version__, self.commit)
@@ -181,6 +186,7 @@ class Agent:
             except (Go2RTCError, aiohttp.ClientError):
                 pass
         self.state.cameras.clear()
+        self.alarms.stop_all()
         self.state.recorders.clear()
         for key in list(self.playbacks):
             await self._drop_playback(key)
@@ -208,6 +214,7 @@ class Agent:
                     self.config.ws_url, headers=self._hub_headers(), heartbeat=25
                 ) as ws:
                     log.info("connected to cloud")
+                    self.ws = ws
                     backoff = 1.0
                     await ws.send_json({"type": "hello", "data": {
                         "agent_version": __version__,
@@ -232,6 +239,16 @@ class Agent:
             log.info("reconnecting in %.0fs", delay)
             await asyncio.sleep(delay)
             backoff = min(backoff * 2, 30.0)
+
+    def _emit_event(self, event: dict) -> None:
+        """Send a recorder event (motion, video loss, ...) to the cloud, if connected."""
+        ws = self.ws
+        if ws is None or ws.closed:
+            log.info("event dropped (not connected to cloud): %s", event.get("kind"))
+            return
+        task = asyncio.create_task(ws.send_json({"type": "event", "data": event}))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def _handle(self, ws: aiohttp.ClientWebSocketResponse, message: dict) -> None:
         request_id = message.get("id")
@@ -331,8 +348,10 @@ class Agent:
                 described = await c.describe()
             self.state.recorders[data["recorder_id"]] = rec
             self.store.save(self.state)
+            self.alarms.start(data["recorder_id"], rec)
             return described
         if command == "recorder.remove":
+            self.alarms.stop(data["recorder_id"])
             self.state.recorders.pop(data["recorder_id"], None)
             self.store.save(self.state)
             return {}
