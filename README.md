@@ -79,3 +79,17 @@ git reset --hard origin/main   # ignored files (state-prod, .venv, go2rtc.exe, l
 ```
 
 Anyone who can push to the repo can run code on the hub, so keep write access to yourself.
+
+
+## Install on Windows (one command)
+
+Open **PowerShell as administrator** on a PC that stays on, on the same network as the cameras:
+
+```powershell
+irm https://raw.githubusercontent.com/ALBERTOESCALARI/hovercam-hub/main/install-hub.ps1 | iex
+```
+
+It installs Git, Python, go2rtc and ffmpeg, puts the hub in `C:\HoverCam`, starts it now and at
+every boot (as a background task), and shows the pairing code for the app's **Add hub**. The hub
+then updates itself from this repo. Running it again repairs/updates the install; it won't create
+a second hub if one is already installed elsewhere on the PC.
