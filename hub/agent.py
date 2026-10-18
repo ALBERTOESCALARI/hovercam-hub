@@ -12,6 +12,7 @@ import json
 import logging
 import random
 import secrets
+import shutil
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -357,14 +358,10 @@ class Agent:
         if not pb.info:
             await self._drop_playback(key)
             raise CommandError(pb.error or "no video in that time range")
-        fmt = "hevc" if pb.info.get("codec") == "hevc" else "h264"
         fps = int(pb.info.get("fps") or 15)
-        source = (
-            f"exec:ffmpeg -hide_banner -loglevel error -re -f {fmt} -framerate {fps} "
-            f"-i http://127.0.0.1:{self.config.status_port}/playback/{key} -an "
-            f"-c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline "
-            f"-pix_fmt yuv420p -vf scale=-2:720 -g {fps * 2} -f rtsp {{output}}"
-        )
+        # go2rtc 1.9.12+ refuses exec: sources from its API, so go2rtc pulls a plain local
+        # HTTP MPEG-TS feed instead; the hub runs ffmpeg itself when go2rtc connects.
+        source = f"http://127.0.0.1:{self.config.status_port}/playback/{key}"
         await self.go2rtc.add_stream(key, source)
         started = pb.info.get("started")
         return {"stream_key": key, "codec": pb.info.get("codec"), "fps": fps,
@@ -398,32 +395,68 @@ class Agent:
             pb.ready.set()
 
     async def _serve_playback(self, request: web.Request) -> web.StreamResponse:
+        """Local-only MPEG-TS feed for go2rtc: recorder video re-encoded to H.264 by ffmpeg,
+        paced in real time (-re)."""
         if request.remote not in ("127.0.0.1", "::1"):
             raise web.HTTPForbidden()
         pb = self.playbacks.get(request.match_info["key"])
-        if pb is None:
+        if pb is None or not pb.info:
             raise web.HTTPNotFound()
-        resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream"})
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            log.warning("playback needs ffmpeg on PATH")
+            raise web.HTTPServiceUnavailable()
+        fmt = "hevc" if pb.info.get("codec") == "hevc" else "h264"
+        fps = int(pb.info.get("fps") or 15)
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-re", "-f", fmt,
+            "-framerate", str(fps), "-i", "pipe:0", "-an",
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-profile:v", "baseline", "-pix_fmt", "yuv420p", "-vf", "scale=-2:720",
+            "-g", str(fps * 2), "-f", "mpegts", "-flush_packets", "1", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+
+        async def feed() -> None:
+            try:
+                while True:
+                    while pb.chunks:
+                        chunk = pb.chunks.popleft()
+                        pb.buffered -= len(chunk)
+                        pb.space.set()
+                        proc.stdin.write(chunk)
+                        await proc.stdin.drain()
+                        pb.last_active = time.monotonic()
+                    if pb.done:
+                        break
+                    pb.data.clear()
+                    await asyncio.wait_for(pb.data.wait(), 60)
+            except (asyncio.TimeoutError, ConnectionError, BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+        resp = web.StreamResponse(headers={"Content-Type": "video/mp2t"})
         await resp.prepare(request)
         pb.readers += 1
+        feeder = asyncio.create_task(feed())
         try:
             while True:
-                while pb.chunks:
-                    chunk = pb.chunks.popleft()
-                    pb.buffered -= len(chunk)
-                    pb.space.set()
-                    await resp.write(chunk)
-                    pb.last_active = time.monotonic()
-                if pb.done:
+                out = await proc.stdout.read(65536)
+                if not out:
                     break
-                pb.data.clear()
-                try:
-                    await asyncio.wait_for(pb.data.wait(), 60)
-                except asyncio.TimeoutError:
-                    break
+                await resp.write(out)
+                pb.last_active = time.monotonic()
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
+            feeder.cancel()
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
             pb.readers -= 1
             pb.last_active = time.monotonic()
         return resp

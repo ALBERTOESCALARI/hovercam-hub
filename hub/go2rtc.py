@@ -19,7 +19,8 @@ class Go2RTC:
         url = f"{self.base}/api/streams?name={quote(name)}&src={quote(src, safe='')}"
         async with self.session.put(url) as res:
             if res.status >= 400:
-                raise Go2RTCError(f"add stream failed ({res.status})")
+                detail = (await res.text()).strip()[:200]
+                raise Go2RTCError(f"add stream failed ({res.status}: {detail})")
 
     async def remove_stream(self, name: str) -> None:
         async with self.session.delete(f"{self.base}/api/streams?src={quote(name)}") as res:

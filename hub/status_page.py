@@ -31,6 +31,6 @@ def make_app(get_state, playback_handler=None) -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
     if playback_handler is not None:
-        # Local-only feed of unwrapped recorder video that go2rtc's ffmpeg reads from.
+        # Local-only MPEG-TS feed of recorder video that go2rtc pulls for playback.
         app.router.add_get("/playback/{key}", playback_handler)
     return app
