@@ -201,10 +201,11 @@ def test_overlay_changes_go_to_the_camera_itself():
         import hub.recorder as rec
         old, rec.PORT = rec.PORT, server.sockets[0].getsockname()[1]
         try:
-            await nvr_settings.apply_to_camera("127.0.0.1", "u", "p",
-                                               {"channel": 7, "show_title": False})
-            await nvr_settings.apply_to_camera("127.0.0.1", "u", "p",
-                                               {"channel": 7, "title": "Living room"})
+            async with RecorderClient("127.0.0.1", "u", "p") as c:
+                await nvr_settings.apply_to_camera(c, {"channel": 7, "show_title": False})
+                await nvr_settings.apply_to_camera(c, {"channel": 7, "title": "Living room"})
+                assert await nvr_settings.read_camera_overlay(c) == {"show_title": False,
+                                                                     "show_time": True}
         finally:
             rec.PORT = old
             server.close()
@@ -214,3 +215,11 @@ def test_overlay_changes_go_to_the_camera_itself():
     assert w["ChannelTitleAttribute"]["EncodeBlend"] is False
     assert w["TimeTitleAttribute"]["EncodeBlend"] is True
     assert w["ChannelTitle"]["Name"] == "Living room" and cam.cfg["ChannelTitle"] == ["Living room"]
+
+
+def test_camera_logins_come_from_the_recorder():
+    fake = FakeRecorder()
+    fake.cfg["NetWork.RemoteDeviceV3"][1]["Decoder"][0].update(UserName="admin", PassWord="s3cret")
+    got = run(fake, nvr_settings.camera_logins)
+    assert got["192.168.0.104"] == ("admin", "s3cret")
+    assert got["192.168.0.108"] == ("admin", "")

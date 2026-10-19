@@ -8,6 +8,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import random
@@ -73,6 +74,12 @@ class Agent:
         self.commit: str | None = None
         self.ws: aiohttp.ClientWebSocketResponse | None = None
         self.alarms = alarms.AlarmWatcher(self._emit_event)
+        # Camera logins for overlay changes (memory only): ip -> [(user, password), ...] to
+        # try, the one that worked, and failures not to retry for a while (a camera locks
+        # its account after a few wrong passwords).
+        self._cam_logins: dict[str, list[tuple[str, str]]] = {}
+        self._cam_ok: dict[str, tuple[str, str]] = {}
+        self._cam_failed: dict[tuple[str, str, str], float] = {}
 
     # ---- lifecycle -------------------------------------------------------------------
 
@@ -363,6 +370,7 @@ class Agent:
         if command == "recorder.settings.get":
             async with self._client(self._recorder(data["recorder_id"])) as c:
                 settings = await nvr_settings.read(c, self._camera_ips())
+                await self._learn_camera_logins(c)
             await self._camera_overlays(settings)
             return settings
         if command == "recorder.settings.set":
@@ -371,6 +379,7 @@ class Agent:
                 result = await nvr_settings.apply(c, change)
                 if not change.get("reboot"):
                     result["settings"] = await nvr_settings.read(c, self._camera_ips())
+                    await self._learn_camera_logins(c)
             if set(nvr_settings.OVERLAY_KEYS) & change.keys() and "settings" in result:
                 result["camera"] = await self._overlay_to_camera(result["settings"], change)
             if "settings" in result:
@@ -387,45 +396,69 @@ class Agent:
             return {}
         raise CommandError(f"unknown command {command!r}")
 
-    def _camera_login(self, ip: str | None) -> tuple[str, str, str] | None:
-        url = next((u for u in self.state.cameras.values() if ip and urlparse(u).hostname == ip),
-                   None)
-        return imaging.login_from_rtsp(url) if url else None
+    async def _learn_camera_logins(self, c: RecorderClient) -> None:
+        """Candidate logins per camera IP: the recorder's own (works for sure) first, then
+        the one typed when the camera was added to live view."""
+        nvr = await nvr_settings.camera_logins(c)
+        rtsp = {}
+        for url in self.state.cameras.values():
+            host, user, password = imaging.login_from_rtsp(url)
+            if host:
+                rtsp[host] = (user or "admin", password)
+        for ip in set(nvr) | set(rtsp):
+            self._cam_logins[ip] = list(dict.fromkeys(
+                [x for x in (self._cam_ok.get(ip), nvr.get(ip), rtsp.get(ip)) if x]))
+
+    async def _with_camera(self, ip: str | None, fn):
+        """Run fn(client) on the camera at ip with the first login that works. Never
+        retries a login that failed in the last 6 hours, so cameras don't get locked."""
+        if not ip or not self._cam_logins.get(ip):
+            raise RecorderError("no login known for this camera")
+        locked_out = False
+        for user, password in self._cam_logins[ip]:
+            key = (ip, user, hashlib.sha256(password.encode()).hexdigest())
+            if time.monotonic() - self._cam_failed.get(key, -1e9) < 6 * 3600:
+                continue
+            try:
+                async with RecorderClient(ip, user, password, timeout=5) as cam:
+                    result = await fn(cam)
+                self._cam_ok[ip] = (user, password)
+                return result
+            except RecorderError as exc:
+                if "password" not in str(exc) and "locked" not in str(exc):
+                    raise
+                self._cam_failed[key] = time.monotonic()
+                locked_out = locked_out or "locked" in str(exc)
+        raise RecorderError("the camera locked its login for ~30 minutes; try again later"
+                            if locked_out else "the camera didn't accept any login HoverCam knows")
 
     async def _camera_overlays(self, settings: dict) -> None:
         """Show what each camera really draws on its video (the camera decides, not the
-        recorder) for the cameras this hub can log in to; others keep the recorder's value."""
+        recorder); cameras HoverCam can't log in to keep the recorder's value."""
         async def one(chan: dict) -> None:
-            login = self._camera_login(chan.get("ip"))
-            if login is None:
-                return
             try:
-                chan.update({k: v for k, v in
-                             (await nvr_settings.read_camera_overlay(*login)).items()
-                             if v is not None})
-                chan["overlay_from_camera"] = True
+                got = await self._with_camera(chan.get("ip"), nvr_settings.read_camera_overlay)
             except (RecorderError, OSError, asyncio.TimeoutError):
-                pass
+                return
+            chan.update({k: v for k, v in got.items() if v is not None})
+            chan["overlay_from_camera"] = True
 
         await asyncio.gather(*(one(ch) for ch in settings.get("channels") or []))
 
     async def _overlay_to_camera(self, settings: dict, change: dict) -> str:
         """Send name/clock overlay changes to the camera itself (it draws them). Returns
-        "ok", "no_login" (that camera isn't in HoverCam's live view, so the hub has no
-        login for it) or the camera's error."""
+        "ok", "no_login" or the reason the camera refused."""
         chans = settings.get("channels") or []
         ch = change.get("channel")
         ip = chans[ch].get("ip") if isinstance(ch, int) and 0 <= ch < len(chans) else None
-        login = self._camera_login(ip)
-        if login is None:
+        if not ip or not self._cam_logins.get(ip):
             return "no_login"
-        host, user, password = login
         try:
-            await nvr_settings.apply_to_camera(host, user, password, change)
+            await self._with_camera(ip, lambda cam: nvr_settings.apply_to_camera(cam, change))
             return "ok"
-        except RecorderError as exc:
-            log.info("camera %s overlay change failed: %s", host, exc)
-            return str(exc)
+        except (RecorderError, OSError, asyncio.TimeoutError) as exc:
+            log.info("camera %s overlay change failed: %s", ip, exc)
+            return str(exc) or "the camera didn't answer"
 
     def _camera_ips(self) -> dict[str, str]:
         return {key: urlparse(url).hostname or "" for key, url in self.state.cameras.items()}
