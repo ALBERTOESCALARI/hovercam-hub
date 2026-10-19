@@ -23,7 +23,8 @@ import aiohttp
 from aiohttp import web
 
 from hub import (
-    __version__, alarms, discovery, imaging, nvr_settings, onvif, recorder, status_page, updater,
+    __version__, alarms, discovery, imaging, nvr_settings, onvif, recorder, rewind, status_page,
+    updater,
 )
 from hub.config import Config
 from hub.go2rtc import Go2RTC, Go2RTCError
@@ -59,6 +60,7 @@ class Playback:
         self.readers = 0
         self.created = self.last_active = time.monotonic()
         self.task: asyncio.Task | None = None
+        self.speed = 1   # 2-4 fast forward, negative = rewind (see hub/rewind.py)
 
 
 class Agent:
@@ -487,9 +489,14 @@ class Agent:
             await self._drop_playback(oldest)
         key = f"pb_{secrets.token_hex(6)}"
         pb = Playback()
+        pb.speed = rewind.clean_speed(data.get("speed", 1))
         self.playbacks[key] = pb
-        pb.task = asyncio.create_task(
-            self._pull_recording(pb, rec, data["file"], data["start"], data["end"]))
+        if pb.speed < 0:   # rewinds from "end" back to "start"
+            pb.task = asyncio.create_task(
+                self._pull_rewind(pb, rec, data["file"], data["start"], data["end"]))
+        else:
+            pb.task = asyncio.create_task(
+                self._pull_recording(pb, rec, data["file"], data["start"], data["end"]))
         try:
             await asyncio.wait_for(pb.ready.wait(), 25)
         except asyncio.TimeoutError:
@@ -504,7 +511,48 @@ class Agent:
         await self.go2rtc.add_stream(key, source)
         started = pb.info.get("started")
         return {"stream_key": key, "codec": pb.info.get("codec"), "fps": fps,
-                "started": started.isoformat() if started else None}
+                "speed": pb.speed, "started": started.isoformat() if started else None}
+
+    async def _pull_rewind(self, pb: Playback, rec: dict, file: str, floor: str,
+                           start: str) -> None:
+        """Rewind: key frames of 30 s windows, newest first (see hub/rewind.py)."""
+        fmt = recorder.FMT
+        try:
+            lo, hi = datetime.strptime(floor, fmt), datetime.strptime(start, fmt)
+            for t0, t1 in rewind.windows(lo, hi):
+                unwrap = Unwrapper()
+                parts: list[bytes] = []
+                async with self._client(rec) as c:
+                    async for raw in c.stream(file, t0.strftime(fmt), t1.strftime(fmt)):
+                        video = unwrap.feed(raw)
+                        if video:
+                            parts.append(video)
+                frames = await rewind.decode_key_frames(b"".join(parts),
+                                                        unwrap.info.get("codec") or "h264")
+                if not frames:
+                    continue
+                hold = rewind.hold_frames((t1 - t0).total_seconds() / len(frames), pb.speed)
+                if not pb.ready.is_set():
+                    pb.info = {"codec": "rewind", "fps": rewind.REWIND_FPS, "started": hi,
+                               "key_frames": len(frames)}
+                    pb.ready.set()
+                for frame in reversed(frames):
+                    for _ in range(hold):
+                        pb.chunks.append(frame)
+                        pb.buffered += len(frame)
+                    pb.data.set()
+                    while pb.buffered > PLAYBACK_BUFFER:     # viewer is slower: wait
+                        pb.space.clear()
+                        await pb.space.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            pb.error = str(exc) or exc.__class__.__name__
+            log.warning("rewind stopped: %s", pb.error)
+        finally:
+            pb.done = True
+            pb.data.set()
+            pb.ready.set()
 
     async def _pull_recording(self, pb: Playback, rec: dict, file: str, start: str,
                               end: str) -> None:
@@ -547,14 +595,42 @@ class Agent:
             raise web.HTTPServiceUnavailable()
         fmt = "hevc" if pb.info.get("codec") == "hevc" else "h264"
         fps = int(pb.info.get("fps") or 15)
+        decoder = None
+        if pb.speed < 0:     # raw 640x360 key frames from _pull_rewind
+            inputs, filters, out_fps = rewind.raw_input_args(rewind.REWIND_FPS), [], rewind.REWIND_FPS
+        elif pb.speed > 1:   # decoder squeezes time, encoder plays its frames at a steady rate
+            inputs, filters, out_fps = rewind.raw_input_args(rewind.FAST_FPS), [], rewind.FAST_FPS
+            decoder = await asyncio.create_subprocess_exec(
+                *rewind.fast_decoder_args(ffmpeg, fmt, fps, pb.speed),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+        else:
+            inputs = ["-re", "-f", fmt, "-framerate", str(fps), "-i", "pipe:0"]
+            filters, out_fps = ["-vf", "scale=-2:720"], fps
         proc = await asyncio.create_subprocess_exec(
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-re", "-f", fmt,
-            "-framerate", str(fps), "-i", "pipe:0", "-an",
+            ffmpeg, "-hide_banner", "-loglevel", "error", *inputs, "-an",
             "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-profile:v", "baseline", "-pix_fmt", "yuv420p", "-vf", "scale=-2:720",
-            "-g", str(fps * 2), "-f", "mpegts", "-flush_packets", "1", "pipe:1",
+            "-profile:v", "baseline", "-pix_fmt", "yuv420p", *filters,
+            "-g", str(out_fps * 2), "-f", "mpegts", "-flush_packets", "1", "pipe:1",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL)
+        sink = decoder.stdin if decoder is not None else proc.stdin
+
+        async def pump() -> None:   # fast forward: decoder frames -> encoder
+            try:
+                while True:
+                    frames = await decoder.stdout.read(rewind.FRAME_BYTES)
+                    if not frames:
+                        break
+                    proc.stdin.write(frames)
+                    await proc.stdin.drain()
+            except (ConnectionError, BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
 
         async def feed() -> None:
             try:
@@ -563,8 +639,8 @@ class Agent:
                         chunk = pb.chunks.popleft()
                         pb.buffered -= len(chunk)
                         pb.space.set()
-                        proc.stdin.write(chunk)
-                        await proc.stdin.drain()
+                        sink.write(chunk)
+                        await sink.drain()
                         pb.last_active = time.monotonic()
                     if pb.done:
                         break
@@ -574,7 +650,7 @@ class Agent:
                 pass
             finally:
                 try:
-                    proc.stdin.close()
+                    sink.close()
                 except Exception:
                     pass
 
@@ -582,6 +658,7 @@ class Agent:
         await resp.prepare(request)
         pb.readers += 1
         feeder = asyncio.create_task(feed())
+        pumper = asyncio.create_task(pump()) if decoder is not None else None
         try:
             while True:
                 out = await proc.stdout.read(65536)
@@ -593,9 +670,13 @@ class Agent:
             pass
         finally:
             feeder.cancel()
-            if proc.returncode is None:
-                proc.kill()
-            await proc.wait()
+            if pumper is not None:
+                pumper.cancel()
+            for p in (decoder, proc):
+                if p is not None and p.returncode is None:
+                    p.kill()
+                if p is not None:
+                    await p.wait()
             pb.readers -= 1
             pb.last_active = time.monotonic()
         return resp
