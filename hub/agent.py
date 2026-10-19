@@ -753,9 +753,26 @@ class Agent:
                     log.info("camera %s picture settings: %s", host, last)
                     raise last or imaging.OnvifError("wrong camera username or password")
                 self._imaging[key] = client
+            settings = data.get("settings") or {}
+            day_night = settings.get("ir_cut") if command == "camera.image.set" else None
             if command == "camera.image.set":
-                await client.set(data.get("settings") or {})
-            return await client.get()
+                try:
+                    await client.set(settings)
+                except imaging.OnvifError:
+                    if set(settings) != {"ir_cut"}:   # only day/night has a second way
+                        raise
+            result = await client.get()
+            if day_night:
+                # Xiongmai cameras often accept ONVIF's day/night but ignore it; set it
+                # their own way too (over DVRIP, with the login the recorder uses).
+                host = urlparse(self.state.cameras[key]).hostname
+                try:
+                    await self._with_camera(
+                        host, lambda cam: nvr_settings.set_day_night(cam, day_night))
+                    result.setdefault("settings", {})["ir_cut"] = str(day_night).upper()
+                except (RecorderError, OSError, asyncio.TimeoutError) as exc:
+                    log.info("day/night on %s via DVRIP failed: %s", host, exc)
+            return result
         except imaging.OnvifError as exc:
             self._imaging.pop(key, None)  # rediscover next time (camera moved, login changed)
             log.info("picture settings for %s failed: %s", key, exc)

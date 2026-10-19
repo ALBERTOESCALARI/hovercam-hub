@@ -290,3 +290,30 @@ async def camera_logins(c: RecorderClient) -> dict[str, tuple[str, str]]:
             if ip and d.get("Enable", True):
                 out[ip] = (str(d.get("UserName") or "admin"), str(d.get("PassWord") or ""))
     return out
+
+
+DAY_NIGHT = {"AUTO": "0x00000000", "ON": "0x00000001", "OFF": "0x00000002"}  # ON = color
+
+
+async def set_day_night(cam: RecorderClient, mode: str) -> None:
+    """Color / black & white / auto on a Xiongmai camera (Camera.Param.DayNightColor). Many
+    of these cameras accept the ONVIF day/night setting but ignore it; this one sticks."""
+    value = DAY_NIGHT.get(str(mode).upper())
+    if value is None:
+        raise RecorderError("unknown day/night mode")
+    params = await cam.config_get("Camera.Param")
+    items = params if isinstance(params, list) else [params]
+    if not items or "DayNightColor" not in items[0]:
+        raise RecorderError("this camera has no day/night setting")
+    items[0]["DayNightColor"] = value
+    await cam.config_set("Camera.Param", items if isinstance(params, list) else items[0])
+
+
+async def get_day_night(cam: RecorderClient) -> str | None:
+    params = await cam.config_get("Camera.Param")
+    item = (params[0] if isinstance(params, list) and params else params) or {}
+    value = str(item.get("DayNightColor", "")).lower()
+    for mode, hexv in DAY_NIGHT.items():
+        if value and int(value, 16) == int(hexv, 16):
+            return mode
+    return None

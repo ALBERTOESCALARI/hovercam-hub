@@ -223,3 +223,17 @@ def test_camera_logins_come_from_the_recorder():
     got = run(fake, nvr_settings.camera_logins)
     assert got["192.168.0.104"] == ("admin", "s3cret")
     assert got["192.168.0.108"] == ("admin", "")
+
+
+def test_day_night_color_on_a_xiongmai_camera():
+    cam = FakeRecorder()
+    cam.cfg = {"Camera.Param": [{"AeSensitivity": 5, "DayNightColor": "0x00000000"}]}
+
+    async def go(c):
+        await nvr_settings.set_day_night(c, "ON")
+        return await nvr_settings.get_day_night(c)
+
+    assert run(cam, go) == "ON"
+    assert cam.cfg["Camera.Param"][0] == {"AeSensitivity": 5, "DayNightColor": "0x00000001"}
+    with pytest.raises(RecorderError):
+        run(cam, lambda c: nvr_settings.set_day_night(c, "PURPLE"))
