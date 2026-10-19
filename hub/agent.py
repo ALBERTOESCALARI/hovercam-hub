@@ -467,12 +467,14 @@ class Agent:
 
     async def _clock_keeper(self) -> None:
         """Keep each recorder's clock right (recordings and alerts are stamped with it):
-        every 6 hours, set it to this PC's time if it is more than 90 seconds off."""
-        await asyncio.sleep(120)
+        every 6 hours, set it to this PC's time if it is more than 90 seconds off. Also
+        refreshes the camera logins the recorder knows (for picture/overlay settings)."""
+        await asyncio.sleep(20)
         while True:
             for rid, rec in list(self.state.recorders.items()):
                 try:
                     async with self._client(rec) as c:
+                        await self._learn_camera_logins(c)
                         nvr = await c.get_time()
                         off = (nvr - datetime.now()).total_seconds() if nvr else 0
                         if abs(off) > 90:
@@ -491,6 +493,8 @@ class Agent:
         pb = Playback()
         pb.speed = rewind.clean_speed(data.get("speed", 1))
         self.playbacks[key] = pb
+        log.info("playback %s: %s %s..%s at %sx", key, data["file"], data["start"],
+                 data["end"], pb.speed)
         if pb.speed < 0:   # rewinds from "end" back to "start"
             pb.task = asyncio.create_task(
                 self._pull_rewind(pb, rec, data["file"], data["start"], data["end"]))
@@ -576,6 +580,9 @@ class Agent:
         except Exception as exc:
             pb.error = str(exc) or exc.__class__.__name__
             log.warning("playback stopped: %s", pb.error)
+        else:
+            log.info("recording download finished (%d key frames, %d frames)",
+                     unwrap.info["key_frames"], unwrap.info["frames"])
         finally:
             pb.done = True
             pb.data.set()
@@ -603,7 +610,7 @@ class Agent:
             decoder = await asyncio.create_subprocess_exec(
                 *rewind.fast_decoder_args(ffmpeg, fmt, fps, pb.speed),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL)
+                stderr=asyncio.subprocess.PIPE)
         else:
             inputs = ["-re", "-f", fmt, "-framerate", str(fps), "-i", "pipe:0"]
             filters, out_fps = ["-vf", "scale=-2:720"], fps
@@ -613,7 +620,7 @@ class Agent:
             "-profile:v", "baseline", "-pix_fmt", "yuv420p", *filters,
             "-g", str(out_fps * 2), "-f", "mpegts", "-flush_packets", "1", "pipe:1",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL)
+            stderr=asyncio.subprocess.PIPE)
         sink = decoder.stdin if decoder is not None else proc.stdin
 
         async def pump() -> None:   # fast forward: decoder frames -> encoder
@@ -659,12 +666,27 @@ class Agent:
         pb.readers += 1
         feeder = asyncio.create_task(feed())
         pumper = asyncio.create_task(pump()) if decoder is not None else None
+        sent = 0
+        errors: list[str] = []
+
+        async def collect(p, name: str) -> None:   # ffmpeg complaints, for the log
+            try:
+                text = (await p.stderr.read()).decode("utf-8", "replace").strip()
+                if text:
+                    errors.append(f"{name}: {text[-400:]}")
+            except Exception:  # noqa: BLE001
+                pass
+
+        collectors = [asyncio.create_task(collect(proc, "encoder"))]
+        if decoder is not None:
+            collectors.append(asyncio.create_task(collect(decoder, "decoder")))
         try:
             while True:
                 out = await proc.stdout.read(65536)
                 if not out:
                     break
                 await resp.write(out)
+                sent += len(out)
                 pb.last_active = time.monotonic()
         except (ConnectionResetError, asyncio.CancelledError):
             pass
@@ -677,6 +699,11 @@ class Agent:
                     p.kill()
                 if p is not None:
                     await p.wait()
+            await asyncio.gather(*collectors, return_exceptions=True)
+            key = request.match_info["key"]
+            if pb.readers <= 1 and (sent < 10000 or errors or pb.error):
+                log.warning("playback %s sent %d bytes (done=%s, error=%s) %s", key, sent,
+                            pb.done, pb.error, " | ".join(errors))
             pb.readers -= 1
             pb.last_active = time.monotonic()
         return resp
@@ -710,13 +737,28 @@ class Agent:
             if client is None:
                 host, user, password = imaging.login_from_rtsp(self.state.cameras[key])
                 xaddr = await imaging.find_xaddr(self.session, host)
-                client = await imaging.CameraImaging.connect(self.session, xaddr, user, password)
+                # The login typed when the camera was added first, then the one the
+                # recorder uses for it (often the only one the camera really accepts).
+                logins = list(dict.fromkeys([(user, password), *self._cam_logins.get(host, [])]))
+                last: Exception | None = None
+                for u, p in logins:
+                    try:
+                        client = await imaging.CameraImaging.connect(self.session, xaddr, u, p)
+                        break
+                    except imaging.OnvifError as exc:
+                        last = exc
+                        if "password" not in str(exc):
+                            raise
+                if client is None:
+                    log.info("camera %s picture settings: %s", host, last)
+                    raise last or imaging.OnvifError("wrong camera username or password")
                 self._imaging[key] = client
             if command == "camera.image.set":
                 await client.set(data.get("settings") or {})
             return await client.get()
         except imaging.OnvifError as exc:
             self._imaging.pop(key, None)  # rediscover next time (camera moved, login changed)
+            log.info("picture settings for %s failed: %s", key, exc)
             raise CommandError(str(exc)) from None
 
     def _known(self, key: str) -> str:

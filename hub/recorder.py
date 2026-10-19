@@ -60,6 +60,13 @@ class RecorderClient:
 
     async def close(self) -> None:
         if self._w is not None:
+            if self.session:   # log out, so the recorder frees the session right away
+                try:
+                    await asyncio.wait_for(
+                        self._send_only(1002, {"Name": "", "SessionID": "0x%08X" % self.session}),
+                        2)
+                except Exception:  # noqa: BLE001
+                    pass
             self._w.close()
             try:
                 await self._w.wait_closed()
@@ -164,6 +171,17 @@ class RecorderClient:
         return [{"name": f["FileName"], "begin": f["BeginTime"], "end": f["EndTime"],
                  "size_kb": int(str(f.get("FileLength", "0")), 0)} for f in out]
 
+    async def _keepalive(self) -> None:
+        """Recorders drop a session that hasn't sent a keep-alive for a while, even if it is
+        busy receiving (alarms, a download). Send one on a timer, whatever else happens."""
+        sid = "0x%08X" % self.session
+        try:
+            while True:
+                await asyncio.sleep(self.alive)
+                await self._send_only(1006, {"Name": "KeepAlive", "SessionID": sid})
+        except (asyncio.CancelledError, ConnectionError, OSError, AttributeError):
+            pass
+
     async def stream(self, file_name: str, start: str, end: str) -> AsyncIterator[bytes]:
         """Yield the raw recording (Xiongmai framing) for start..end of one file."""
         param = {"PlayMode": "ByName", "FileName": file_name, "StreamType": 0, "Value": 0,
@@ -174,19 +192,25 @@ class RecorderClient:
             raise RecorderError(f"recorder refused playback ({claim.get('Ret')})")
         await self._send_only(1420, {"Name": "OPPlayBack", "OPPlayBack": {
             "Action": "DownloadStart", "Parameter": param, "StartTime": start, "EndTime": end}})
-        first = True
-        while True:
-            try:
-                _, data = await self._read_packet(timeout=30)
-            except (asyncio.TimeoutError, asyncio.IncompleteReadError):
-                return
-            if not data:
-                return
-            if first and data.lstrip().startswith(b"{"):
+        keepalive = asyncio.create_task(self._keepalive())
+        try:
+            first = True
+            while True:
+                try:
+                    msgid, data = await self._read_packet(timeout=30)
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    return
+                if msgid == 1007:      # keep-alive reply, not video
+                    continue
+                if not data:
+                    return
+                if first and data.lstrip().startswith(b"{"):
+                    first = False
+                    continue
                 first = False
-                continue
-            first = False
-            yield data
+                yield data
+        finally:
+            keepalive.cancel()
 
 
     async def alarms(self) -> AsyncIterator[dict]:
@@ -196,24 +220,29 @@ class RecorderClient:
         recorder doesn't drop the session. Returns when the connection ends."""
         sid = "0x%08X" % self.session
         await self._send_only(1500, {"Name": "", "SessionID": sid})   # guard / subscribe
-        while True:
-            try:
-                msgid, payload = await self._read_packet(timeout=self.alive)
-            except asyncio.TimeoutError:
-                await self._send_only(1006, {"Name": "KeepAlive", "SessionID": sid})
-                continue
-            except (asyncio.IncompleteReadError, ConnectionError, OSError):
-                return
-            if msgid != 1504:
-                continue  # subscribe / keep-alive replies
-            text = payload.rstrip(b"\x00\x0a").decode("utf-8", "replace")
-            try:
-                body = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            info = body.get("AlarmInfo") or body.get(body.get("Name", "")) or {}
-            if isinstance(info, dict) and info:
-                yield info
+        # Keep-alives go out on their own timer: a busy camera sends alarm messages every
+        # second, and a keep-alive sent only when it's quiet never went out (the recorder
+        # then dropped the session about once a minute).
+        keepalive = asyncio.create_task(self._keepalive())
+        try:
+            while True:
+                try:
+                    msgid, payload = await self._read_packet(timeout=self.alive * 4)
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError,
+                        OSError):
+                    return   # nothing at all (not even keep-alive replies): connection is dead
+                if msgid != 1504:
+                    continue  # subscribe / keep-alive replies
+                text = payload.rstrip(b"\x00\x0a").decode("utf-8", "replace")
+                try:
+                    body = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                info = body.get("AlarmInfo") or body.get(body.get("Name", "")) or {}
+                if isinstance(info, dict) and info:
+                    yield info
+        finally:
+            keepalive.cancel()
 
 
 def local_subnet() -> ipaddress.IPv4Network | None:

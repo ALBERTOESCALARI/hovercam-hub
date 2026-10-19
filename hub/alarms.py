@@ -19,6 +19,7 @@ log = logging.getLogger("hovercam.alarms")
 KINDS = {
     "videomotion": "motion", "motiondetect": "motion", "smartmotion": "motion",
     "humandetect": "person", "humandection": "person", "persondetect": "person",
+    "appeventhumandetectalarm": "person",
     "cardetect": "vehicle", "vehicledetect": "vehicle",
     "videoloss": "video_loss", "videoblind": "tamper", "localalarm": "alarm_input",
 }
