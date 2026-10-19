@@ -269,11 +269,16 @@ async def apply_to_camera(cam: RecorderClient, change: dict) -> None:
 
 
 async def read_camera_overlay(cam: RecorderClient) -> dict:
-    """What the camera itself draws on its video: {"show_title", "show_time"}."""
+    """What the camera itself does: {"show_title", "show_time", "day_night"}."""
     widgets = await cam.config_get("AVEnc.VideoWidget")
     w = (widgets[0] if isinstance(widgets, list) and widgets else widgets) or {}
-    return {"show_title": (w.get("ChannelTitleAttribute") or {}).get("EncodeBlend"),
-            "show_time": (w.get("TimeTitleAttribute") or {}).get("EncodeBlend")}
+    out = {"show_title": (w.get("ChannelTitleAttribute") or {}).get("EncodeBlend"),
+           "show_time": (w.get("TimeTitleAttribute") or {}).get("EncodeBlend")}
+    try:
+        out["day_night"] = await get_day_night(cam)
+    except (RecorderError, ValueError):
+        pass
+    return out
 
 
 async def camera_logins(c: RecorderClient) -> dict[str, tuple[str, str]]:

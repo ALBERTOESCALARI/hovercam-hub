@@ -384,6 +384,8 @@ class Agent:
                     await self._learn_camera_logins(c)
             if set(nvr_settings.OVERLAY_KEYS) & change.keys() and "settings" in result:
                 result["camera"] = await self._overlay_to_camera(result["settings"], change)
+            if change.get("day_night") and "settings" in result:
+                result["camera"] = await self._day_night_to_cameras(result["settings"], change)
             if "settings" in result:
                 await self._camera_overlays(result["settings"])
             return result
@@ -446,6 +448,26 @@ class Agent:
             chan["overlay_from_camera"] = True
 
         await asyncio.gather(*(one(ch) for ch in settings.get("channels") or []))
+
+    async def _day_night_to_cameras(self, settings: dict, change: dict) -> str:
+        """Auto / color / black & white on one camera (channel given) or all of them.
+        Returns "ok" or which cameras refused and why."""
+        mode = str(change["day_night"]).upper()
+        chans = settings.get("channels") or []
+        ch = change.get("channel")
+        targets = [c for c in chans if ch is None or c.get("channel") == ch]
+
+        async def one(chan: dict) -> str | None:
+            try:
+                await self._with_camera(chan.get("ip"),
+                                        lambda cam: nvr_settings.set_day_night(cam, mode))
+                return None
+            except (RecorderError, OSError, asyncio.TimeoutError) as exc:
+                log.info("day/night on %s failed: %s", chan.get("ip"), exc)
+                return f"{chan.get('title') or chan.get('ip')}: {exc or 'no answer'}"
+
+        failed = [f for f in await asyncio.gather(*(one(c) for c in targets)) if f]
+        return "ok" if not failed else "; ".join(failed)
 
     async def _overlay_to_camera(self, settings: dict, change: dict) -> str:
         """Send name/clock overlay changes to the camera itself (it draws them). Returns
