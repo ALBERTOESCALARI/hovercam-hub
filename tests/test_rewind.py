@@ -60,3 +60,34 @@ def test_fast_forward_pipeline_plays_four_times_faster():
                          "-c:v", "libx264", "-f", "mpegts", "pipe:1"], input=raw,
                         capture_output=True, check=True).stdout
     assert ts and 1.5 < time.monotonic() - t < 4             # paced in real time
+
+
+def test_playback_runs_through_every_file_in_the_range():
+    import types
+
+    from hub.agent import Agent
+
+    files = [  # a continuous hour the recorder split at two alarms (plus one overlap)
+        {"name": "/a.h264", "begin": "2026-10-20 12:00:00", "end": "2026-10-20 12:20:00"},
+        {"name": "/b.h264", "begin": "2026-10-20 12:20:00", "end": "2026-10-20 12:21:10"},
+        {"name": "/c.h264", "begin": "2026-10-20 12:21:00", "end": "2026-10-20 13:00:00"},
+    ]
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def files(self, channel, begin, end):
+            return files
+
+    hub = types.SimpleNamespace(_client=lambda rec: FakeClient())
+    pieces = asyncio.run(Agent._pieces(hub, {}, "/a.h264", 3, "2026-10-20 12:10:00",
+                                       "2026-10-20 12:30:00"))
+    assert pieces == [("/a.h264", "2026-10-20 12:10:00", "2026-10-20 12:20:00"),
+                      ("/b.h264", "2026-10-20 12:20:00", "2026-10-20 12:21:10"),
+                      ("/c.h264", "2026-10-20 12:21:10", "2026-10-20 12:30:00")]
+    # No channel (older app): just the file it asked for.
+    assert asyncio.run(Agent._pieces(hub, {}, "/a.h264", None, "x", "y")) == [("/a.h264", "x", "y")]

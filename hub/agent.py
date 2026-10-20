@@ -519,10 +519,12 @@ class Agent:
                  data["end"], pb.speed)
         if pb.speed < 0:   # rewinds from "end" back to "start"
             pb.task = asyncio.create_task(
-                self._pull_rewind(pb, rec, data["file"], data["start"], data["end"]))
+                self._pull_rewind(pb, rec, data["file"], data["start"], data["end"],
+                                  data.get("channel")))
         else:
             pb.task = asyncio.create_task(
-                self._pull_recording(pb, rec, data["file"], data["start"], data["end"]))
+                self._pull_recording(pb, rec, data["file"], data["start"], data["end"],
+                                     data.get("channel")))
         try:
             await asyncio.wait_for(pb.ready.wait(), 25)
         except asyncio.TimeoutError:
@@ -539,20 +541,46 @@ class Agent:
         return {"stream_key": key, "codec": pb.info.get("codec"), "fps": fps,
                 "speed": pb.speed, "started": started.isoformat() if started else None}
 
+    async def _pieces(self, rec: dict, file: str, channel, start: str,
+                      end: str) -> list[tuple[str, str, str]]:
+        """The recorder's files covering start..end, as (file, from, to), oldest first.
+        Recorders split a continuous recording into a new file at every alarm, so one
+        stretch of video can be dozens of files; playback runs through all of them."""
+        pieces: list[tuple[str, str, str]] = []
+        if isinstance(channel, int):
+            try:
+                async with self._client(rec) as c:
+                    files = await c.files(channel, start, end)
+                for f in sorted(files, key=lambda f: f["begin"]):
+                    a, b = max(start, f["begin"]), min(end, f["end"])
+                    if pieces:
+                        a = max(a, pieces[-1][2])   # overlapping files: don't play twice
+                    if a < b:
+                        pieces.append((f["name"], a, b))
+            except RecorderError as exc:
+                log.info("file list for playback failed (%s); playing one file", exc)
+        return pieces or [(file, start, end)]
+
     async def _pull_rewind(self, pb: Playback, rec: dict, file: str, floor: str,
-                           start: str) -> None:
+                           start: str, channel=None) -> None:
         """Rewind: key frames of 30 s windows, newest first (see hub/rewind.py)."""
         fmt = recorder.FMT
         try:
             lo, hi = datetime.strptime(floor, fmt), datetime.strptime(start, fmt)
+            pieces = await self._pieces(rec, file, channel, floor, start)
             for t0, t1 in rewind.windows(lo, hi):
+                w0, w1 = t0.strftime(fmt), t1.strftime(fmt)
                 unwrap = Unwrapper()
                 parts: list[bytes] = []
-                async with self._client(rec) as c:
-                    async for raw in c.stream(file, t0.strftime(fmt), t1.strftime(fmt)):
-                        video = unwrap.feed(raw)
-                        if video:
-                            parts.append(video)
+                for name, a, b in pieces:
+                    a, b = max(a, w0), min(b, w1)
+                    if a >= b:
+                        continue
+                    async with self._client(rec) as c:
+                        async for raw in c.stream(name, a, b):
+                            video = unwrap.feed(raw)
+                            if video:
+                                parts.append(video)
                 frames = await rewind.decode_key_frames(b"".join(parts),
                                                         unwrap.info.get("codec") or "h264")
                 if not frames:
@@ -581,22 +609,23 @@ class Agent:
             pb.ready.set()
 
     async def _pull_recording(self, pb: Playback, rec: dict, file: str, start: str,
-                              end: str) -> None:
+                              end: str, channel=None) -> None:
         try:
-            async with self._client(rec) as c:
-                unwrap = Unwrapper()
-                async for raw in c.stream(file, start, end):
-                    video = unwrap.feed(raw)
-                    if video:
-                        pb.chunks.append(video)
-                        pb.buffered += len(video)
-                        pb.data.set()
-                    if unwrap.info["key_frames"] and not pb.ready.is_set():
-                        pb.info = dict(unwrap.info)
-                        pb.ready.set()
-                    while pb.buffered > PLAYBACK_BUFFER:     # viewer is slower: wait
-                        pb.space.clear()
-                        await pb.space.wait()
+            unwrap = Unwrapper()
+            for name, a, b in await self._pieces(rec, file, channel, start, end):
+                async with self._client(rec) as c:
+                    async for raw in c.stream(name, a, b):
+                        video = unwrap.feed(raw)
+                        if video:
+                            pb.chunks.append(video)
+                            pb.buffered += len(video)
+                            pb.data.set()
+                        if unwrap.info["key_frames"] and not pb.ready.is_set():
+                            pb.info = dict(unwrap.info)
+                            pb.ready.set()
+                        while pb.buffered > PLAYBACK_BUFFER:     # viewer is slower: wait
+                            pb.space.clear()
+                            await pb.space.wait()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
