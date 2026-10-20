@@ -34,6 +34,9 @@ def clean_speed(value) -> int:
 
 
 FAST_FPS = 12                                   # output frame rate while fast forwarding
+# Decode recorder video (often H.265, heavy) on the graphics chip when the PC has one;
+# ffmpeg quietly falls back to the processor when it doesn't.
+HWACCEL = ["-hwaccel", "auto"]
 _FIT = (f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
         f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2")
 
@@ -41,8 +44,8 @@ _FIT = (f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
 def fast_decoder_args(ffmpeg: str, codec: str, fps: int, speed: int) -> list[str]:
     """First stage of fast forward: raw recording in, 640x360 frames at FAST_FPS out."""
     return [ffmpeg, "-hide_banner", "-loglevel", "error",
-            "-f", "hevc" if codec == "hevc" else "h264", "-framerate", str(fps), "-i", "pipe:0",
-            "-an", "-vf", f"setpts=PTS/{speed},fps={FAST_FPS},{_FIT}",
+            *HWACCEL, "-f", "hevc" if codec == "hevc" else "h264", "-framerate", str(fps),
+            "-i", "pipe:0", "-an", "-vf", f"setpts=PTS/{speed},fps={FAST_FPS},{_FIT}",
             "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"]
 
 

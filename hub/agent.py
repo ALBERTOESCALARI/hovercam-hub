@@ -663,11 +663,14 @@ class Agent:
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE)
         else:
-            inputs = ["-re", "-f", fmt, "-framerate", str(fps), "-i", "pipe:0"]
-            filters, out_fps = ["-vf", "scale=-2:720"], fps
+            inputs = ["-re", *rewind.HWACCEL, "-f", fmt, "-framerate", str(fps), "-i", "pipe:0"]
+            filters, out_fps = ["-vf", "scale=-2:720:flags=fast_bilinear"], fps
         proc = await asyncio.create_subprocess_exec(
             ffmpeg, "-hide_banner", "-loglevel", "error", *inputs, "-an",
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            # ultrafast + capped bitrate: the PC must keep up in real time or the picture
+            # freezes; recorder video decodes on the graphics chip when there is one.
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-crf", "26", "-maxrate", "2500k", "-bufsize", "5000k",
             "-profile:v", "baseline", "-pix_fmt", "yuv420p", *filters,
             "-g", str(out_fps * 2), "-f", "mpegts", "-flush_packets", "1", "pipe:1",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
