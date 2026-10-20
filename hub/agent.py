@@ -61,6 +61,7 @@ class Playback:
         self.created = self.last_active = time.monotonic()
         self.task: asyncio.Task | None = None
         self.speed = 1   # 2-4 fast forward, negative = rewind (see hub/rewind.py)
+        self.quality = "normal"   # or "low" (480p) for PCs that can't keep up
 
 
 class Agent:
@@ -514,9 +515,10 @@ class Agent:
         key = f"pb_{secrets.token_hex(6)}"
         pb = Playback()
         pb.speed = rewind.clean_speed(data.get("speed", 1))
+        pb.quality = rewind.clean_quality(data.get("quality"))
         self.playbacks[key] = pb
-        log.info("playback %s: %s %s..%s at %sx", key, data["file"], data["start"],
-                 data["end"], pb.speed)
+        log.info("playback %s: %s %s..%s at %sx, %s quality", key, data["file"],
+                 data["start"], data["end"], pb.speed, pb.quality)
         if pb.speed < 0:   # rewinds from "end" back to "start"
             pb.task = asyncio.create_task(
                 self._pull_rewind(pb, rec, data["file"], data["start"], data["end"],
@@ -663,15 +665,12 @@ class Agent:
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE)
         else:
-            inputs = ["-re", *rewind.HWACCEL, "-f", fmt, "-framerate", str(fps), "-i", "pipe:0"]
-            filters, out_fps = ["-vf", "scale=-2:720:flags=fast_bilinear"], fps
+            inputs = ["-re", "-f", fmt, "-framerate", str(fps), "-i", "pipe:0"]
+            filters, out_fps = ["-vf", rewind.QUALITY[pb.quality]["scale"]], fps
         proc = await asyncio.create_subprocess_exec(
             ffmpeg, "-hide_banner", "-loglevel", "error", *inputs, "-an",
-            # ultrafast + capped bitrate: the PC must keep up in real time or the picture
-            # freezes; recorder video decodes on the graphics chip when there is one.
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-crf", "26", "-maxrate", "2500k", "-bufsize", "5000k",
-            "-profile:v", "baseline", "-pix_fmt", "yuv420p", *filters,
+            "-c:v", "libx264", *rewind.QUALITY[pb.quality if pb.speed == 1 else "normal"]["x264"],
+            "-tune", "zerolatency", "-profile:v", "baseline", "-pix_fmt", "yuv420p", *filters,
             "-g", str(out_fps * 2), "-f", "mpegts", "-flush_packets", "1", "pipe:1",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)

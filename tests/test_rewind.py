@@ -91,3 +91,20 @@ def test_playback_runs_through_every_file_in_the_range():
                       ("/c.h264", "2026-10-20 12:21:10", "2026-10-20 12:30:00")]
     # No channel (older app): just the file it asked for.
     assert asyncio.run(Agent._pieces(hub, {}, "/a.h264", None, "x", "y")) == [("/a.h264", "x", "y")]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_both_playback_qualities_encode():
+    video = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=10",
+         "-t", "2", "-c:v", "libx264", "-g", "10", "-f", "h264", "pipe:1"],
+        capture_output=True, check=True).stdout
+    assert rewind.clean_quality("low") == "low" and rewind.clean_quality("4k") == "normal"
+    for q in ("normal", "low"):
+        out = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-f", "h264", "-framerate", "10", "-i", "pipe:0",
+             "-an", "-c:v", "libx264", *rewind.QUALITY[q]["x264"], "-tune", "zerolatency",
+             "-profile:v", "baseline", "-pix_fmt", "yuv420p", "-vf", rewind.QUALITY[q]["scale"],
+             "-g", "20", "-f", "mpegts", "pipe:1"],
+            input=video, capture_output=True, check=True).stdout
+        assert len(out) > 1000, q
